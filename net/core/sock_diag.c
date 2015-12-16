@@ -135,7 +135,22 @@ void sock_diag_unregister(const struct sock_diag_handler *hnld)
 }
 EXPORT_SYMBOL_GPL(sock_diag_unregister);
 
-static int __sock_diag_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh)
+static inline struct sock_diag_handler *sock_diag_lock_handler(int family)
+{
+	if (sock_diag_handlers[family] == NULL)
+		request_module("net-pf-%d-proto-%d-type-%d", PF_NETLINK,
+				NETLINK_SOCK_DIAG, family);
+
+	mutex_lock(&sock_diag_table_mutex);
+	return sock_diag_handlers[family];
+}
+
+static inline void sock_diag_unlock_handler(struct sock_diag_handler *h)
+{
+	mutex_unlock(&sock_diag_table_mutex);
+}
+
+static int __sock_diag_cmd(struct sk_buff *skb, struct nlmsghdr *nlh)
 {
 	int err;
 	struct sock_diag_req *req = nlmsg_data(nlh);
@@ -155,9 +170,13 @@ static int __sock_diag_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh)
 	hndl = sock_diag_handlers[req->sdiag_family];
 	if (hndl == NULL)
 		err = -ENOENT;
-	else
+	else if (nlh->nlmsg_type == SOCK_DIAG_BY_FAMILY)
 		err = hndl->dump(skb, nlh);
-	mutex_unlock(&sock_diag_table_mutex);
+	else if (nlh->nlmsg_type == SOCK_DESTROY_BACKPORT && hndl->destroy)
+		err = hndl->destroy(skb, nlh);
+	else
+		err = -EOPNOTSUPP;
+	sock_diag_unlock_handler(hndl);
 
 	return err;
 }
@@ -182,7 +201,8 @@ static int sock_diag_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh)
 
 		return ret;
 	case SOCK_DIAG_BY_FAMILY:
-		return __sock_diag_rcv_msg(skb, nlh);
+	case SOCK_DESTROY_BACKPORT:
+		return __sock_diag_cmd(skb, nlh);
 	default:
 		return -EINVAL;
 	}
@@ -197,26 +217,20 @@ static void sock_diag_rcv(struct sk_buff *skb)
 	mutex_unlock(&sock_diag_mutex);
 }
 
-static int __net_init diag_net_init(struct net *net)
+int sock_diag_destroy(struct sock *sk, int err)
 {
-	struct netlink_kernel_cfg cfg = {
-		.input	= sock_diag_rcv,
-	};
+	if (!capable(CAP_NET_ADMIN))
+		return -EPERM;
 
-	net->diag_nlsk = netlink_kernel_create(net, NETLINK_SOCK_DIAG, &cfg);
-	return net->diag_nlsk == NULL ? -ENOMEM : 0;
+	if (!sk->sk_prot->diag_destroy)
+		return -EOPNOTSUPP;
+
+	return sk->sk_prot->diag_destroy(sk, err);
 }
+EXPORT_SYMBOL_GPL(sock_diag_destroy);
 
-static void __net_exit diag_net_exit(struct net *net)
-{
-	netlink_kernel_release(net->diag_nlsk);
-	net->diag_nlsk = NULL;
-}
-
-static struct pernet_operations diag_net_ops = {
-	.init = diag_net_init,
-	.exit = diag_net_exit,
-};
+struct sock *sock_diag_nlsk;
+EXPORT_SYMBOL_GPL(sock_diag_nlsk);
 
 static int __init sock_diag_init(void)
 {
